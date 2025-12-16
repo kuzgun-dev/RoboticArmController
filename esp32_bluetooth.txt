@@ -1,0 +1,360 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <DHT.h>
+#include "BluetoothSerial.h" // EKLENDİ: Bluetooth kütüphanesi
+
+// Bluetooth Nesnesi
+BluetoothSerial SerialBT;
+
+// PCA9685 servo sürücü
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// Pin tanımlamaları - L298N fan kontrolü
+#define IN1_PIN 16  // Motor A kontrol
+#define IN2_PIN 17  // Motor A kontrol
+#define STEP_PIN 18
+#define DIR_PIN 19
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define LIMIT_SWITCH_PIN 15
+
+// DHT11 sıcaklık sensörü
+#define DHT_PIN 23        // DHT11 data pin
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// Servo kanalları (PCA9685 üzerinde)
+#define SERVO1_CHANNEL 0  // Gripper servo
+#define SERVO2_CHANNEL 1  // Kremer dişli servo
+
+// Step motor ayarları
+const int STEPS_PER_REV = 400;  // 1/2 step mod
+const int STEP_DELAY = 500;     // mikrosaniye
+const float HARMONIC_RATIO = 32.0;  // Harmonic drive oranı
+
+// Servo açı limitleri
+#define SERVO_MIN 102   
+#define SERVO_MAX 512   
+
+// Sıcaklık eşikleri
+#define TEMP_LOW_THRESHOLD 40.0    // Fan başlatma eşiği
+#define TEMP_HIGH_THRESHOLD 45.0   // Yüksek sıcaklık eşiği
+#define TEMP_FAN_OFF 35.0          // Fan durdurma eşiği
+
+// Sistem durumu
+bool systemCalibrated = false;
+int currentStepPosition = 0;
+bool fanRunning = false;
+bool manualFanOverride = false;  
+float currentTemperature = 0.0;
+unsigned long lastTempCheck = 0;
+const unsigned long TEMP_CHECK_INTERVAL = 2000; 
+
+// Harf pozisyonları
+struct LetterPosition {
+  char letter;
+  int angle;
+};
+
+LetterPosition letterPositions[] = {
+  {'A', 0},
+  {'B', 62},
+  {'C', 135},
+  {'D', 208},
+  {'E', 279}
+};
+
+// Fonksiyon prototipleri
+void executeMovement(char startBox, char endBox);
+void processCommand(String command); // Yeni komut işleyici
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Bluetooth Başlatma
+  SerialBT.begin("Robotic_Arm"); // Bluetooth cihaz adı
+  Serial.println("Robotik Sistem Başlatılıyor... Bluetooth Hazır!");
+  
+  // Pin modları
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+  
+  // DHT11 sensörünü başlat
+  dht.begin();
+  
+  // Fanları başlangıçta kapat
+  stopFans();
+  
+  // I2C başlat
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // PCA9685 başlat
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);  
+  pwm.setOutputMode(true);  
+  pwm.setPWMFreq(60);  
+  delay(10);
+  
+  delay(2000); 
+  
+  // İlk sıcaklık okuması
+  checkTemperature();
+  
+  // Sistem kalibrasyonu
+  calibrateSystem();
+  
+  String readyMsg = "Sistem hazir! Komut girin (Ornek: AB, CE, DE vb.)";
+  Serial.println(readyMsg);
+  SerialBT.println(readyMsg); // Telefona da bilgi gönder
+}
+
+void loop() {
+  // Sıcaklık kontrolünü düzenli olarak yap
+  if (millis() - lastTempCheck >= TEMP_CHECK_INTERVAL) {
+    checkTemperature();
+    lastTempCheck = millis();
+  }
+  
+  // USB Serial'den veri gelirse oku
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    processCommand(command);
+  }
+
+  // Bluetooth'tan veri gelirse oku
+  if (SerialBT.available()) {
+    String command = SerialBT.readString(); // Bluetooth üzerinden string oku
+    command.trim(); // Boşlukları temizle
+    processCommand(command);
+  }
+}
+
+// Komutları işleyen merkezi fonksiyon
+void processCommand(String command) {
+  command.toUpperCase();
+  
+  // 1. ÖZEL KOMUTLAR
+  if (command == "ON") {
+    if (currentTemperature < TEMP_LOW_THRESHOLD) {
+      manualFanOverride = true;
+      startFans();
+      fanRunning = true;
+      String msg = "MANUEL ACMA: Fanlar acildi (" + String(currentTemperature) + "C)";
+      Serial.println(msg);
+      SerialBT.println(msg);
+    } else {
+      String msg = "Fanlar zaten otomatik acik (" + String(currentTemperature) + "C)";
+      Serial.println(msg);
+      SerialBT.println(msg);
+    }
+    return;
+  }
+  
+  if (command == "OFF") {
+    if (currentTemperature >= TEMP_LOW_THRESHOLD) {
+      String msg = "UYARI: Sicaklik yuksek (" + String(currentTemperature) + "C), kapatilamaz!";
+      Serial.println(msg);
+      SerialBT.println(msg);
+    } else {
+      manualFanOverride = false;
+      stopFans();
+      fanRunning = false;
+      String msg = "Fanlar kapatildi (" + String(currentTemperature) + "C)";
+      Serial.println(msg);
+      SerialBT.println(msg);
+    }
+    return;
+  }
+  
+  if (command == "TEMP") {
+    checkTemperature();
+    String status = "Sicaklik: " + String(currentTemperature) + "C | Fan: " + String(fanRunning ? "ACIK" : "KAPALI");
+    Serial.println(status);
+    SerialBT.println(status);
+    return;
+  }
+  
+  // 2. ROBOT HAREKET KOMUTLARI (2 Harfli)
+  if (command.length() == 2) {
+    char startBox = command.charAt(0);
+    char endBox = command.charAt(1);
+    
+    if ((startBox >= 'A' && startBox <= 'E') && (endBox >= 'A' && endBox <= 'E')) {
+      String msg = "Komut alindi: " + command;
+      Serial.println(msg);
+      SerialBT.println(msg);
+      executeMovement(startBox, endBox);
+    } else {
+      String msg = "Gecersiz harf! Sadece A-E arasi.";
+      Serial.println(msg);
+      SerialBT.println(msg);
+    }
+    return;
+  }
+  
+  // Geçersiz komut
+  SerialBT.println("Gecersiz Komut. Ornek: AB, ON, OFF");
+}
+
+void checkTemperature() {
+  float temperature = dht.readTemperature();
+  
+  if (isnan(temperature)) {
+    Serial.println("DHT11 hata!");
+    return;
+  }
+  
+  currentTemperature = temperature;
+  // Serial.println("Sicaklik: " + String(currentTemperature) + "C"); // Çok fazla spam yapmasın diye kapattım
+  
+  updateFanControl(currentTemperature);
+  
+  // İstersen her ölçümde telefona veri atabilirsin ama bu trafiği şişirebilir.
+  // Sadece kritik değişimlerde veya isteyince (TEMP komutu ile) göndermek daha iyidir.
+}
+
+void updateFanControl(float temperature) {
+  if (temperature >= TEMP_LOW_THRESHOLD) {
+    if (!fanRunning) {
+      startFans();
+      fanRunning = true;
+      SerialBT.println("OTOMATIK FAN: ACIK (" + String(temperature) + "C)");
+    }
+    manualFanOverride = false;
+  } 
+  else if (temperature <= TEMP_FAN_OFF) {
+    if (!manualFanOverride && fanRunning) {
+      stopFans();
+      fanRunning = false;
+      SerialBT.println("OTOMATIK FAN: KAPALI (" + String(temperature) + "C)");
+    }
+  }
+}
+
+void startFans() {
+  digitalWrite(IN1_PIN, HIGH);
+  digitalWrite(IN2_PIN, LOW);
+  // Serial.println("Fanlar aktif");
+}
+
+void stopFans() {
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, LOW);
+  // Serial.println("Fanlar pasif");
+}
+
+void calibrateSystem() {
+  Serial.println("Kalibrasyon basliyor...");
+  SerialBT.println("Kalibrasyon yapiliyor...");
+  
+  moveServo(SERVO1_CHANNEL, 5); 
+  moveServo(SERVO2_CHANNEL, 5); 
+  delay(2000);
+  
+  calibrateStepMotor();
+  
+  moveServo(SERVO1_CHANNEL, 5);
+  delay(1000);
+  
+  systemCalibrated = true;
+  Serial.println("Kalibrasyon Tamam!");
+  SerialBT.println("Sistem Hazir.");
+}
+
+void calibrateStepMotor() {
+  digitalWrite(DIR_PIN, HIGH); 
+  
+  while (digitalRead(LIMIT_SWITCH_PIN) == HIGH) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(STEP_DELAY);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(STEP_DELAY);
+  }
+  
+  delay(500);
+  
+  // 5 derece ofset
+  int stepsFor5Degrees = (STEPS_PER_REV * HARMONIC_RATIO * 5) / 360;
+  digitalWrite(DIR_PIN, LOW); 
+  
+  for (int i = 0; i < stepsFor5Degrees; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(STEP_DELAY);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(STEP_DELAY);
+  }
+  
+  currentStepPosition = 0; 
+}
+
+void executeMovement(char startBox, char endBox) {
+  if (!systemCalibrated) {
+    SerialBT.println("HATA: Sistem kalibre degil!");
+    return;
+  }
+  
+  int startAngle = getLetterAngle(startBox);
+  int endAngle = getLetterAngle(endBox);
+  
+  if (startAngle == -1 || endAngle == -1) return;
+  
+  SerialBT.println("Islem: " + String(startBox) + " -> " + String(endBox));
+  
+  // Hareket adımları (Mevcut kod ile aynı)
+  moveStepMotorToAngle(startAngle);
+  delay(1000);
+  moveServo(SERVO2_CHANNEL, 175);
+  delay(2000);
+  moveServo(SERVO1_CHANNEL, 73); 
+  delay(2000);
+  moveServo(SERVO2_CHANNEL, 5);
+  delay(2000);
+  moveStepMotorToAngle(endAngle);
+  delay(1000);
+  moveServo(SERVO2_CHANNEL, 175);
+  delay(2000);
+  moveServo(SERVO1_CHANNEL, 5);
+  delay(2000);
+  moveServo(SERVO2_CHANNEL, 5);
+  delay(2000);
+  
+  calibrateStepMotor();
+  moveServo(SERVO1_CHANNEL, 5);
+  
+  SerialBT.println("Gorev tamamlandi!");
+}
+
+void moveServo(int channel, int angle) {
+  if (channel == SERVO1_CHANNEL) angle = constrain(angle, 5, 73);
+  else if (channel == SERVO2_CHANNEL) angle = constrain(angle, 5, 175);
+  
+  int pulseWidth = map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
+  pwm.setPWM(channel, 0, pulseWidth);
+}
+
+void moveStepMotorToAngle(int targetAngle) {
+  int angleDifference = targetAngle - currentStepPosition;
+  int totalSteps = abs((STEPS_PER_REV * HARMONIC_RATIO * angleDifference) / 360);
+  
+  if (angleDifference > 0) digitalWrite(DIR_PIN, LOW);
+  else digitalWrite(DIR_PIN, HIGH);
+  
+  for (int i = 0; i < totalSteps; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(STEP_DELAY);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(STEP_DELAY);
+  }
+  currentStepPosition = targetAngle;
+}
+
+int getLetterAngle(char letter) {
+  for (int i = 0; i < sizeof(letterPositions) / sizeof(letterPositions[0]); i++) {
+    if (letterPositions[i].letter == letter) return letterPositions[i].angle;
+  }
+  return -1;
+}
